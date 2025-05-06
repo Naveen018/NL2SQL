@@ -1,0 +1,15 @@
+pandas
+Faker
+mysql-connector-python
+python-dotenv
+flask
+flask-cors
+matplotlib
+numpy
+fastapi
+uvicorn
+langchain
+langchain-openai
+langchain_community
+langchain_experimental
+apache_superset
