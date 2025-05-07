@@ -12,4 +12,17 @@ langchain
 langchain-openai
 langchain_community
 langchain_experimental
-apache_superset
+transformers
+torch
+huggingface_hub
+pydantic
+crewai
+llama-index
+sqlalchemy
+langchain-groq
+llama-index-llms-groq
+ratelimit
+joblib
+tenacity
+streamlit
+# apache_superset

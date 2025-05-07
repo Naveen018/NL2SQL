@@ -60,24 +60,39 @@ QUESTION_TEMPLATES = {
     ]
 }
 
-# Options for multiple-choice questions
-GENERIC_OPTIONS = [
-    ['A mutable sequence', 'A class', 'A function', 'A loop'],
-    ['Returns length', 'Prints text', 'Loops over items', 'Defines a function'],
-    ['A blueprint for classes', 'A loop', 'A variable', 'A method'],
-    ['True', 'False', 'Maybe', 'None'],
-    ['Increases speed', 'Reduces memory', 'Improves accuracy', 'None of the above']
+# Options for multiple-choice questions with corresponding correct answers
+OPTIONS_WITH_CORRECT = [
+    {
+        'options': ['A mutable sequence', 'A class', 'A function', 'A loop'],
+        'correct': 'A'
+    },
+    {
+        'options': ['Returns length', 'Prints text', 'Loops over items', 'Defines a function'],
+        'correct': 'A'
+    },
+    {
+        'options': ['A blueprint for classes', 'A loop', 'A variable', 'A method'],
+        'correct': 'A'
+    },
+    {
+        'options': ['True', 'False', 'Maybe', 'None'],
+        'correct': 'A'
+    },
+    {
+        'options': ['Increases speed', 'Reduces memory', 'Improves accuracy', 'None of the above'],
+        'correct': 'C'
+    }
 ]
 
 # 1. Generate Students_Courses
 def generate_students_courses():
     data = []
     student_emails = set()
+    used_combinations = set()  # Track (student_id, course_id)
     student_id = 1
-    used_combinations = set()
     
     while len(data) < NUM_ENROLLMENTS:
-        # Generate unique student
+        # Generate unique email
         while True:
             email = fake.email()
             if email not in student_emails:
@@ -89,9 +104,9 @@ def generate_students_courses():
         course = random.choice(COURSES)
         course_id = course['course_id']
         course_name = course['course_name']
-        combination = (student_name, course_name)
+        combination = (student_id, course_id)
         
-        # Avoid duplicate enrollments
+        # Avoid duplicate (student_id, course_id)
         if combination not in used_combinations:
             used_combinations.add(combination)
             data.append({
@@ -105,14 +120,23 @@ def generate_students_courses():
             })
             student_id += 1
     
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # Validate unique emails
+    if df['student_email'].duplicated().any():
+        raise ValueError("Duplicate student emails detected")
+    # Validate unique (student_id, course_id)
+    if df[['student_id', 'course_id']].duplicated().any():
+        raise ValueError("Duplicate (student_id, course_id) detected")
+    return df
 
 # 2. Generate Questions_Answers
 def generate_questions_answers(students_courses):
     data = []
     answer_id = 1
+    # Course-specific question ID counter
+    question_id_counter = {course['course_id']: 100 * course['course_id'] for course in COURSES}
     
-    # Get valid student_id and course_id pairs
+    # Get valid enrollments
     valid_enrollments = students_courses[['student_id', 'course_id', 'course_name']].to_dict('records')
     
     for _ in range(NUM_ANSWERS):
@@ -122,17 +146,19 @@ def generate_questions_answers(students_courses):
         course_id = enrollment['course_id']
         course_name = enrollment['course_name']
         
-        # Select a question
+        # Generate question
         question_text = random.choice(QUESTION_TEMPLATES[course_name])
-        question_id = random.randint(1, 1000)  # Simplified question ID
+        question_id = question_id_counter[course_id]
+        question_id_counter[course_id] += 1  # Increment for next question
         
         # Generate options
-        options = random.choice(GENERIC_OPTIONS)
+        option_set = random.choice(OPTIONS_WITH_CORRECT)
+        options = option_set['options']
+        correct_answer = option_set['correct']
         options_dict = {chr(65+i): opt for i, opt in enumerate(options)}  # A, B, C, D
-        correct_answer = options[0]  # First option is correct for simplicity
         
         # Simulate student answer
-        student_answer = random.choice(options)
+        student_answer = random.choice([chr(65+i) for i in range(len(options))])
         is_correct = student_answer == correct_answer
         
         data.append({
@@ -148,15 +174,25 @@ def generate_questions_answers(students_courses):
         })
         answer_id += 1
     
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # Validate foreign key
+    merged = df.merge(
+        students_courses[['student_id', 'course_id']],
+        on=['student_id', 'course_id'],
+        how='left',
+        indicator=True
+    )
+    if (merged['_merge'] != 'both').any():
+        raise ValueError("Invalid (student_id, course_id) pairs in question_answers")
+    return df
 
 # 3. Generate Exam_Results
 def generate_exam_results(students_courses):
     data = []
     result_id = 1
     
-    # Get valid student_id, course_id, and names
-    valid_enrollments = students_courses[['student_id', 'course_id', 'student_name', 'course_name']].to_dict('records')
+    # Get valid enrollments
+    valid_enrollments = students_courses[['student_id', 'student_name', 'course_id', 'course_name']].to_dict('records')
     
     for _ in range(NUM_RESULTS):
         # Sample a valid enrollment
@@ -164,6 +200,7 @@ def generate_exam_results(students_courses):
         
         data.append({
             'result_id': result_id,
+            'student_id': enrollment['student_id'],
             'student_name': enrollment['student_name'],
             'course_id': enrollment['course_id'],
             'course_name': enrollment['course_name'],
@@ -171,7 +208,17 @@ def generate_exam_results(students_courses):
         })
         result_id += 1
     
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # Validate foreign key
+    merged = df.merge(
+        students_courses[['student_id', 'course_id']],
+        on=['student_id', 'course_id'],
+        how='left',
+        indicator=True
+    )
+    if (merged['_merge'] != 'both').any():
+        raise ValueError("Invalid (student_id, course_id) pairs in exam_results")
+    return df
 
 # Generate and save CSVs
 def main():

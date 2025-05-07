@@ -1,238 +1,461 @@
-import mysql.connector
-from flask import Flask, render_template, request, jsonify, abort
+from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
-from pydantic import BaseModel
-from langchain.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_community.utilities.sql_database import SQLDatabase
-from langchain.chains import create_sql_query_chain
-import pandas as pd
-from typing import List, Dict, Any
-import re
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain_community.utilities import SQLDatabase
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from llama_index.core import SQLDatabase as LlamaSQLDatabase, Settings
+from llama_index.core.query_engine import NLSQLTableQueryEngine
+from llama_index.llms.openai_like import OpenAILike
+from sqlalchemy import create_engine
 from dotenv import load_dotenv
+import os
 import logging
+import re
+import json
+from typing import Dict, List, Any
+import pandas as pd
+from ratelimit import limits, sleep_and_retry
+from joblib import Memory
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx
 
+# Load environment variables
 load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__, template_folder="../frontend")
-CORS(app)
+# Initialize Flask app with static and template folders
+app = Flask(__name__, 
+    static_folder="../frontend",
+    static_url_path="",
+    template_folder="../frontend")
+CORS(app, resources={r"/query": {"origins": ["http://localhost:5080", "http://localhost:3000"]}})
 
 # MySQL connection configuration
 db_config = {
-    "host": "localhost",
-    "user": "root",
-    "password": "test123",
-    "database": "llm_db",
+    "host": os.getenv('DB_HOST', 'localhost'),
+    "user": os.getenv('DB_USER', 'root'),
+    "password": os.getenv('DB_PASSWORD', 'test1234'),
+    "database": os.getenv('DB_NAME', 'llm_db'),
 }
 
-# SQLDatabase setup for LangChain
+# Initialize LangChain SQLDatabase
 db_uri = f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}@{db_config['host']}/{db_config['database']}"
-db = SQLDatabase.from_uri(db_uri)
+langchain_db = SQLDatabase.from_uri(db_uri)
+logger.info(f"Connected to MySQL database: {db_config['database']}")
 
-# LangChain setup with OpenAI (using GPT-4o-mini)
-llm = ChatOpenAI(model="gpt-4o-mini")
+# Initialize SQLAlchemy engine for execute_query and validate_sql_query
+sqlalchemy_engine = create_engine(db_uri)
 
-# Database schema description
+# Initialize LlamaIndex
+llama_db = LlamaSQLDatabase.from_uri(db_uri)
+Settings.llm = OpenAILike(
+    model="deepseek-r1-distill-llama-70b",
+    api_base="https://api.groq.com/openai/v1",
+    api_key=os.getenv('GROQ_API_KEY'),
+    is_chat_model=True,
+    temperature=0.5
+)
+sql_query_engine = NLSQLTableQueryEngine(
+    sql_database=llama_db,
+    tables=["exam_results", "student_courses", "question_answers"],
+    verbose=True
+)
+
+# Initialize LangChain LLM
+llm = ChatGroq(
+    model="deepseek-r1-distill-llama-70b",
+    api_key=os.getenv('GROQ_API_KEY'),
+    temperature=0.5
+)
+
+# Rate limiting: 30 requests per minute (60 seconds)
+CALLS = 30
+PERIOD = 60
+
+# Cache setup
+cache_dir = "./cache"
+if not os.path.exists(cache_dir):
+    os.makedirs(cache_dir)
+memory = Memory(cache_dir, verbose=0)
+
+# Database schema description (for prompts)
 table_info = """
 Table: student_courses
-Columns: student_id (INT), student_name (VARCHAR), student_email (VARCHAR), course_id (INT), course_name (VARCHAR), course_fees (FLOAT), course_instructor (VARCHAR)
+Columns: student_id (INT NOT NULL), student_name (VARCHAR(100) NOT NULL), student_email (VARCHAR(255) NOT NULL UNIQUE), course_id (INT NOT NULL), course_name (VARCHAR(100) NOT NULL), course_fees (DECIMAL(10,2) NOT NULL), course_instructor (VARCHAR(100) NOT NULL)
+Constraints: PRIMARY KEY (student_id, course_id), UNIQUE (student_email), INDEX idx_course_id (course_id)
 
 Table: question_answers
-Columns: answer_id (INT), course_id (INT), student_id (INT), question_id (INT), question_text (TEXT), options (JSON), correct_answer (VARCHAR), student_answer (VARCHAR), is_correct (BOOLEAN)
+Columns: answer_id (INT PRIMARY KEY), course_id (INT NOT NULL), student_id (INT NOT NULL), question_id (INT NOT NULL), question_text (TEXT NOT NULL), options (JSON NOT NULL), correct_answer (VARCHAR(255) NOT NULL), student_answer (VARCHAR(255) NOT NULL), is_correct (BOOLEAN NOT NULL)
+Constraints: FOREIGN KEY (student_id, course_id) REFERENCES student_courses(student_id, course_id), INDEX idx_question_id (question_id)
 
 Table: exam_results
-Columns: result_id (INT), student_name (VARCHAR), course_id (INT), course_name (VARCHAR), result_percentage (FLOAT)
+Columns: result_id (INT PRIMARY KEY), student_id (INT NOT NULL), student_name (VARCHAR(100) NOT NULL), course_id (INT NOT NULL), course_name (VARCHAR(100) NOT NULL), result_percentage (DECIMAL(5,2) NOT NULL)
+Constraints: FOREIGN KEY (student_id, course_id) REFERENCES student_courses(student_id, course_id), INDEX idx_student_name (student_name)
 """
 
-# General prompt template
-general_prompt_template = PromptTemplate(
-    input_variables=["input", "table_info", "top_k"],
-    template="You are a MySQL expert. Given the following database schema:\n{table_info}\n\nGenerate a valid MySQL query for the following natural language request:\n{input}\n\nUse a LIMIT clause with {top_k} if appropriate. Escape reserved keywords (e.g., `rank`) with backticks. Return only the SQL query without any explanation or additional text.",
+# Rate-limited and cached SQL query generation
+@sleep_and_retry
+@limits(calls=CALLS, period=PERIOD)
+@memory.cache
+def generate_sql_query(query: str) -> str:
+    """Generate SQL query using LlamaIndex."""
+    try:
+        # For "top N in each group" queries, provide explicit context
+        if "top" in query.lower() and "each" in query.lower():
+            query = f"{query}. Use window functions like ROW_NUMBER() to rank within groups, as shown in schema examples."
+        # For "top N in a specific course", include course_name
+        elif "top" in query.lower() and " in " in query.lower():
+            query = f"{query}. Include course_name in the output for clarity."
+        response = sql_query_engine.query(query)
+        sql = str(response.metadata["sql_query"]).strip()
+        logger.debug(f"Generated SQL: {sql}")
+        return sql
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            logger.error(f"Rate limit exceeded in generate_sql_query: {str(e)}")
+            raise
+        logger.error(f"Failed to generate SQL: {str(e)}")
+        return f"Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Failed to generate SQL: {str(e)}")
+        return f"Error: {str(e)}"
+
+# Rate-limited SQL query validation
+@sleep_and_retry
+@limits(calls=CALLS, period=PERIOD)
+def validate_sql_query(sql_query: str, user_query: str = "") -> Dict[str, Any]:
+    """Validate SQL query syntax and semantics. Returns JSON with 'is_valid' (boolean) and 'error' (string)."""
+    try:
+        # Handle dictionary input from agent
+        if isinstance(sql_query, dict):
+            logger.debug(f"Received dict input: {sql_query}")
+            user_query = sql_query.get('user_query', user_query)
+            sql_query = sql_query.get('sql_query', '')
+            # Handle nested dictionary
+            if isinstance(sql_query, dict):
+                user_query = sql_query.get('user_query', user_query)
+                sql_query = sql_query.get('sql_query', '')
+        
+        logger.debug(f"validate_sql_query input: sql_query={sql_query}, user_query={user_query}")
+        cleaned_query = clean_sql_query(sql_query)
+        logger.debug(f"Cleaned query for validation: {cleaned_query}")
+        
+        # Check if query starts with SELECT or WITH
+        if not cleaned_query.lower().lstrip().startswith(('select', 'with')):
+            return {"is_valid": False, "error": "Query must start with SELECT or WITH"}
+        
+        # Semantic check for "top N in each group" queries
+        if "top" in user_query.lower() and "each" in user_query.lower():
+            if not all(keyword in cleaned_query.upper() for keyword in ["ROW_NUMBER()", "PARTITION BY"]):
+                return {"is_valid": False, "error": "Query for 'top N in each group' must use ROW_NUMBER() with PARTITION BY"}
+        
+        # Check for course_name in "top N in a specific course" queries
+        if "top" in user_query.lower() and " in " in user_query.lower() and "each" not in user_query.lower():
+            if "course_name" not in cleaned_query.lower():
+                return {"is_valid": False, "error": "Query for 'top N in a specific course' must include course_name in the output"}
+        
+        with sqlalchemy_engine.connect() as conn:
+            try:
+                conn.execute(f"EXPLAIN {cleaned_query}")
+                logger.debug(f"Query validated: {cleaned_query}")
+                return {"is_valid": True, "error": ""}
+            except Exception as e:
+                logger.error(f"Validation failed: {str(e)}")
+                try:
+                    conn.execute(cleaned_query)
+                    logger.warning(f"Query passed execution but failed EXPLAIN: {cleaned_query}")
+                    return {"is_valid": True, "error": ""}
+                except Exception as exec_e:
+                    return {"is_valid": False, "error": str(exec_e)}
+    except Exception as e:
+        logger.error(f"Unexpected validation error: {str(e)}")
+        return {"is_valid": False, "error": str(e)}
+
+# Rate-limited and cached SQL query fixing
+@sleep_and_retry
+@limits(calls=CALLS, period=PERIOD)
+@memory.cache
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=46),
+    retry=retry_if_exception_type(httpx.HTTPStatusError)
+)
+def fix_sql_query(sql_query: str, error: str = None) -> str:
+    """Fix an invalid SQL query based on error message."""
+    try:
+        # Handle dictionary input from agent
+        if isinstance(sql_query, dict):
+            logger.debug(f"Received dict input for fixer: {sql_query}")
+            error = sql_query.get('error', error)
+            sql_query = sql_query.get('sql_query', '')
+            # Handle nested dictionary
+            if isinstance(sql_query, dict):
+                error = sql_query.get('error', error)
+                sql_query = sql_query.get('sql_query', '')
+        
+        if not error:
+            error = "Unknown error"
+        
+        # Clean the input query first
+        sql_query = clean_sql_query(sql_query)
+        
+        # In fix_sql_query
+        prompt = ChatPromptTemplate.from_template(
+            """
+            The following SQL query failed with error: {error}
+            Query: {sql_query}
+            Schema: {table_info}
+            Fix the query to resolve the error and ensure it matches the schema.
+            If the error involves ONLY_FULL_GROUP_BY, remove non-unique columns from GROUP BY and use aggregation (e.g., MAX) for non-grouped SELECT columns.
+            For 'top N in each group', use ROW_NUMBER() with PARTITION BY and alias as row_num.
+            For 'top N in a specific course', include course_name in the output.
+            If the error involves a reserved keyword like 'rank', replace it with 'row_num'.
+            Return only the corrected SQL query, starting with SELECT or WITH.
+            """
+        )
+        chain = prompt | llm
+        fixed_query = chain.invoke({
+            "error": error,
+            "sql_query": sql_query,
+            "table_info": table_info
+        }).content.strip()
+        
+        # Clean and deduplicate the fixed query
+        fixed_query = clean_sql_query(fixed_query)
+        if fixed_query.count(';') > 1:
+            fixed_query = fixed_query.split(';')[0] + ';'
+        
+        logger.debug(f"Fixed SQL: {fixed_query}")
+        return fixed_query
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            logger.error(f"Rate limit exceeded in fix_sql_query: {str(e)}")
+            raise
+        logger.error(f"Failed to fix SQL: {str(e)}")
+        return sql_query
+    except Exception as e:
+        logger.error(f"Failed to fix SQL: {str(e)}")
+        return sql_query
+
+# LangChain tools
+from langchain_core.tools import tool
+
+# In sql_generator
+@tool
+def sql_generator(query: str) -> str:
+    """Generate an SQL query from a natural language query."""
+    enhanced_query = f"""
+    {query}. When using GROUP BY, include only columns that uniquely identify the group (e.g., question_id for questions).
+    For non-grouped columns in SELECT, use aggregation functions (e.g., MAX) or ensure they are functionally dependent.
+    Comply with MySQL's ONLY_FULL_GROUP_BY mode.
+    """
+    return generate_sql_query(enhanced_query)
+
+@tool
+def sql_validator(sql_query: str, user_query: str = "") -> Dict[str, Any]:
+    """Validate an SQL query. Returns JSON with 'is_valid' (boolean) and 'error' (string)."""
+    return validate_sql_query(sql_query, user_query)
+
+@tool
+def sql_fixer(sql_query: str, error: str = None) -> str:
+    """Fix an invalid SQL query based on the error message."""
+    return fix_sql_query(sql_query, error)
+
+tools = [sql_generator, sql_validator, sql_fixer]
+
+# LangChain ReAct agent
+prompt = ChatPromptTemplate.from_template(
+    """
+    You are an SQL query assistant. Use these tools:
+    {tools}
+    Tool names: {tool_names}
+
+    Format:
+    Thought: <reasoning>
+    Action: <tool_name>
+    Action Input: <input>
+    Observation: <output>
+
+    Steps:
+    1. Use sql_generator to create SQL from user query
+    2. Use sql_validator to check query validity
+    3. If invalid, use sql_fixer with error message
+    4. Return valid query in format:
+    Final Answer: ```sql
+    <query>
+    ```
+
+    Rules:
+    - For "top N in each group": Use ROW_NUMBER() with PARTITION BY, alias as row_num
+    - For "top N in specific course": Include course_name, use simple SELECT with LIMIT
+    - Fix queries missing required fields or window functions
+    - Minimize tool calls
+
+    Schema: {table_info}
+    Query: {query}
+    {agent_scratchpad}
+    """
 )
 
-# Specialized prompt for "top X per group" queries
-group_prompt_template = PromptTemplate(
-    input_variables=["input", "table_info", "top_k"],
-    template="You are a MySQL expert. Given the following database schema:\n{table_info}\n\nGenerate a valid MySQL query for the following natural language request:\n{input}\n\nFor queries requesting 'top X' items per group (e.g., per course or subject), use window functions like ROW_NUMBER() to rank items within each group. If the query involves frequency-based metrics (e.g., most wrong answers), aggregate data (e.g., COUNT) by the grouping column (e.g., course_name) and item (e.g., question_id), then rank by the aggregated value in descending order. If the query involves direct value-based metrics (e.g., highest scores or percentages), rank directly by the value (e.g., result_percentage) in descending order without aggregation. Do not join tables unless additional columns are needed (e.g., course_instructor from student_courses; note that exam_results already has course_name). Escape reserved keywords (e.g., `rank`) with backticks. Select the top {top_k} per group, returning the group column (e.g., course_name), item column (e.g., student_name), and the ranked value (e.g., result_percentage or count). Order results by group and ranked value descending. Return only the SQL query without any explanation or additional text.",
+# Create the agent with the correct input variables
+agent = create_react_agent(
+    llm=llm,
+    tools=tools,
+    prompt=prompt
 )
 
-# Create SQL query chains
-general_sql_chain = create_sql_query_chain(
-    llm=llm, db=db, prompt=general_prompt_template
+# Configure the agent executor with proper input handling
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    handle_parsing_errors=True,
+    max_iterations=8,  # Reduced to minimize API calls
+    return_intermediate_steps=True
 )
-group_sql_chain = create_sql_query_chain(llm=llm, db=db, prompt=group_prompt_template)
-
-
-class QueryRequest(BaseModel):
-    query: str
-
 
 def clean_sql_query(sql_query: str) -> str:
-    """
-    Clean the SQL query by removing Markdown code block markers, extra whitespace, and invalid characters.
-    """
-    # Remove Markdown markers and other code block indicators
-    cleaned_query = re.sub(
-        r"```sql\s*|```mysql\s*|```", "", sql_query, flags=re.IGNORECASE
-    )
-    # Remove extra whitespace and newlines
-    cleaned_query = " ".join(cleaned_query.split())
-    # Remove any leading/trailing non-SQL characters
-    cleaned_query = cleaned_query.strip("` \t\n")
-    # Ensure query ends with semicolon
-    if not cleaned_query.endswith(";"):
-        cleaned_query += ";"
-    return cleaned_query
+    """Clean SQL query by removing Markdown, comments, and extra whitespace."""
+    if not isinstance(sql_query, str):
+        logger.error(f"clean_sql_query received non-string input: {type(sql_query)}")
+        sql_query = str(sql_query)
+    sql_query = re.sub(r'--.*?\n|/\*.*?\*/', '', sql_query, flags=re.DOTALL)
+    sql_query = re.sub(r"```sql\s*|```mysql\s*|```", "", sql_query, flags=re.IGNORECASE)
+    sql_query = sql_query.strip()
+    sql_query = " ".join(sql_query.split())
+    sql_query = re.sub(r';+', ';', sql_query.strip("` \t\n;"))
+    if not sql_query.endswith(";"):
+        sql_query += ";"
+    logger.debug(f"Raw query: {sql_query}")
+    return sql_query
 
-
-def validate_sql_query(sql_query: str) -> bool:
-    """
-    Validate the SQL query by attempting a dry run with EXPLAIN.
-    """
+def execute_query(sql_query: str) -> Dict[str, Any]:
+    """Execute SQL query and return results as DataFrame-compatible dict."""
     try:
         cleaned_query = clean_sql_query(sql_query)
-        # Escape reserved keyword 'rank' if not already escaped
-        cleaned_query = re.sub(
-            r"\bAS rank\b", "AS `rank`", cleaned_query, flags=re.IGNORECASE
-        )
-        logger.debug(f"Validating SQL: {cleaned_query}")
-        conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor()
-        cursor.execute(f"EXPLAIN {cleaned_query}")
-        cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return True
-    except mysql.connector.Error as e:
-        logger.error(f"SQL validation failed: {e}")
-        return False
-
-
-def execute_query(sql_query: str) -> List[Dict[str, Any]]:
-    """
-    Execute the SQL query and return results.
-    """
-    try:
-        cleaned_query = clean_sql_query(sql_query)
-        # Escape reserved keyword 'rank'
-        cleaned_query = re.sub(
-            r"\bAS rank\b", "AS `rank`", cleaned_query, flags=re.IGNORECASE
-        )
         logger.debug(f"Executing query: {cleaned_query}")
-        conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(cleaned_query)
-        results = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return results
-    except mysql.connector.Error as e:
-        logger.error(f"Database error: {e}")
+        with sqlalchemy_engine.connect() as conn:
+            df = pd.read_sql(cleaned_query, conn)
+        logger.info(f"Query executed, returned {len(df)} rows")
+        return {"results": df.to_dict(orient="records"), "columns": df.columns.tolist()}
+    except Exception as e:
+        logger.error(f"Database error: {str(e)}")
         raise Exception(f"Database error: {str(e)}")
 
-
-def suggest_chart_type(df: pd.DataFrame) -> str:
-    """
-    Suggest a chart type based on the DataFrame structure.
-    """
-    if df.empty:
-        return "none"
-    num_columns = len(df.columns)
-    num_rows = len(df)
-    numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns
-    
-    # Faceted bar for grouped ranking queries (e.g., top X per group)
-    if num_columns >= 3 and len(numeric_cols) >= 1 and 'course_name' in df.columns and 'student_name' in df.columns:
-        return "faceted_bar"
-
-    if num_columns == 2 and len(numeric_cols) == 1 and df.iloc[:, 0].nunique() <= 10:
-        return "pie"
-    elif num_columns >= 2 and len(numeric_cols) >= 1:
-        return "bar"
-    elif num_columns == 1 and len(numeric_cols) == 1 and num_rows > 10:
-        return "histogram"
-    else:
-        return "bar"
-
-
-def extract_top_k(query: str) -> int:
-    """
-    Extract the number of results requested from the query (e.g., 'Top 100' -> 100).
-    Default to 10 if no number is found.
-    """
-    match = re.search(r"\btop\s+(\d+)\b", query, re.IGNORECASE)
-    return int(match.group(1)) if match else 10
-
-
-@app.route("/", methods=["GET"])
-def serve_home():
-    return render_template("index.html")
-
-
+@sleep_and_retry
+@limits(calls=CALLS, period=PERIOD)
 @app.route("/query", methods=["POST"])
 def process_query():
     try:
         data = request.get_json()
+        logger.debug(f"Received data: {data}")
         if not data or "query" not in data:
             abort(400, description="Missing 'query' in request body")
 
         query = data["query"]
-        top_k = extract_top_k(query)
-        logger.debug(f"Processing query: {query}, top_k: {top_k}")
+        logger.debug(f"Processing query: {query}")
+        
+        # Initialize steps tracking
+        processing_steps = []
 
-        # Use group prompt for "top X per group" queries
-        group_keywords = [
-            "each course",
-            "per course",
-            "each subject",
-            "by course",
-            "by subject",
-        ]
-        if any(keyword in query.lower() for keyword in group_keywords):
-            sql_chain = group_sql_chain
+        # Run LangChain ReAct agent with the correct input variables
+        try:
+            result = agent_executor.invoke({
+                "query": query,
+                "table_info": table_info,
+                "agent_scratchpad": ""
+            })
+            
+            # Extract steps from intermediate steps
+            if "intermediate_steps" in result:
+                for step in result["intermediate_steps"]:
+                    if isinstance(step, tuple) and len(step) == 2:
+                        action, observation = step
+                        if hasattr(action, 'tool') and hasattr(action, 'tool_input'):
+                            step_info = {
+                                "tool": action.tool,
+                                "input": action.tool_input,
+                                "output": observation
+                            }
+                            processing_steps.append(step_info)
+            
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                logger.error(f"Rate limit exceeded in agent_executor: {str(e)}")
+                return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
+            logger.error(f"Agent execution failed: {str(e)}")
+            return jsonify({"error": "Failed to process query. Please try again with a simpler query."}), 500
+        except Exception as e:
+            logger.error(f"Agent execution failed: {str(e)}")
+            return jsonify({"error": "Failed to process query. Please try again with a simpler query."}), 500
+
+        # Extract SQL query from agent's response
+        response_text = result["output"].strip()
+        logger.debug(f"Agent response: {response_text}")
+
+        # Look for SQL query in Final Answer section
+        final_answer_match = re.search(r'Final Answer:\s*```sql\n?(.*?)\n?```', response_text, re.DOTALL)
+        if final_answer_match:
+            sql_query = final_answer_match.group(1).strip()
         else:
-            sql_chain = general_sql_chain
+            # Check for error message
+            if response_text.startswith("Error:") or "Agent stopped" in response_text:
+                logger.error(f"Agent failed to produce a valid query: {response_text}")
+                return jsonify({"error": "Failed to generate a valid SQL query. Please try rephrasing your question."}), 500
+            # Try fallback regex for SELECT/WITH query
+            sql_match = re.search(r'```sql\n?(.*?)\n?```|SELECT.*?;|WITH.*?;', response_text, re.IGNORECASE | re.DOTALL)
+            if sql_match:
+                sql_query = sql_match.group(1) or sql_match.group(0).strip()
+            else:
+                logger.error(f"Could not extract SQL query from response: {response_text}")
+                return jsonify({"error": "Failed to generate a valid SQL query. Please try rephrasing your question."}), 500
 
-        sql_query = sql_chain.invoke(
-            {"question": query, "top_k": top_k, "table_info": table_info}
-        ).strip()
-        logger.debug(f"Generated SQL: {sql_query}")
+        # Clean and deduplicate the final query
+        sql_query = clean_sql_query(sql_query)
+        if sql_query.count(';') > 1:
+            sql_query = sql_query.split(';')[0] + ';'
+        
+        logger.debug(f"Final SQL query: {sql_query}")
 
-        # Validate SQL query
-        if not validate_sql_query(sql_query):
-            logger.warning("Invalid SQL query detected, attempting to regenerate")
-            sql_query = sql_chain.invoke(
-                {
-                    "question": query
-                    + " (ensure valid MySQL syntax, avoid unnecessary joins, escape reserved keywords like `rank`)",
-                    "top_k": top_k,
-                    "table_info": table_info,
-                }
-            ).strip()
-            logger.debug(f"Regenerated SQL: {sql_query}")
-            if not validate_sql_query(sql_query):
-                raise Exception("Generated SQL query is invalid after retry")
+        # Execute query
+        try:
+            query_result = execute_query(sql_query)
+            # Add execution step
+            processing_steps.append({
+                "tool": "execute_query",
+                "input": sql_query,
+                "output": f"Successfully executed query, returned {len(query_result['results'])} rows"
+            })
+        except Exception as e:
+            logger.error(f"Query execution failed: {str(e)}")
+            return jsonify({"error": f"Failed to execute query: {str(e)}"}), 500
 
-        results = execute_query(sql_query)
-        df = pd.DataFrame(results)
-        chart_type = suggest_chart_type(df)
-
+        # Prepare response
         response = {
             "sql_query": sql_query,
-            "results": results,
-            "chart_type": chart_type,
-            "columns": list(df.columns) if not df.empty else [],
+            "results": query_result["results"],
+            "columns": query_result["columns"],
+            "processing_steps": processing_steps
         }
         logger.debug(f"Response: {response}")
         return jsonify(response)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            logger.error(f"Rate limit exceeded in process_query: {str(e)}")
+            return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
+        logger.exception(f"Error processing query: {str(e)}")
+        return jsonify({"error": str(e)}), 500
     except Exception as e:
-        logger.error(f"Error processing query: {str(e)}")
+        logger.exception(f"Error processing query: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/", methods=["GET"])
+def serve_home():
+    return app.send_static_file("index.html")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5080, debug=True)
