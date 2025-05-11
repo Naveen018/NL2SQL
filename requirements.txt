@@ -6,8 +6,6 @@ flask
 flask-cors
 matplotlib
 numpy
-fastapi
-uvicorn
 langchain
 langchain-openai
 langchain_community
